@@ -26,6 +26,8 @@ import com.amazonaws.retry.PredefinedRetryPolicies;
 import com.amazonaws.retry.RetryPolicy;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
+import com.amazonaws.services.s3.model.CopyObjectRequest;
+import com.amazonaws.services.s3.model.DeleteObjectRequest;
 import com.amazonaws.services.s3.model.ObjectListing;
 import com.amazonaws.services.s3.model.ObjectTagging;
 import com.amazonaws.services.s3.model.SetObjectTaggingRequest;
@@ -113,6 +115,22 @@ public class S3Storage implements Storage<S3SinkConnectorConfig, ObjectListing> 
     this.conf = conf;
     this.bucketName = bucketName;
     this.s3 = s3;
+  }
+
+  public void copyObject(String sourceKey, String destinationKey) {
+    s3.copyObject(new CopyObjectRequest(
+        bucketName,
+        sourceKey,
+        bucketName,
+        destinationKey
+    ));
+  }
+
+  public void deleteObject(String key) {
+    s3.deleteObject(new DeleteObjectRequest(
+        bucketName,
+        key
+    ));
   }
 
   /**

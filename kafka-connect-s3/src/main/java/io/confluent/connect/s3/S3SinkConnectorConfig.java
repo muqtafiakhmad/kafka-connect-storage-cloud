@@ -221,6 +221,19 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
   private static final ParquetCodecRecommender PARQUET_COMPRESSION_RECOMMENDER =
       new ParquetCodecRecommender();
 
+  public static final String FULL_COMMIT_NAME_ENABLED_CONFIG = "full.commit.name.enabled";
+  public static final String FULL_COMMIT_NAME_ENABLED_DOC = "Whether to enable"
+      + " full commit file names";
+  public static final boolean FULL_COMMIT_NAME_ENABLED_DEFAULT = false;
+  public static final String FULL_COMMIT_NAME_ENABLED_DISPLAY = "Enable full commit filename";
+
+  public static final String TOPICS_DIR_TMP_CONFIG = "topics.dir.tmp";
+  public static final String TOPICS_DIR_TMP_DOC = "Top level directory to store "
+      + "temporary data ingested from Kafka.";
+  public static final String TOPICS_DIR_TMP_DEFAULT = "topics_tmp";
+
+  public static final String TOPICS_DIR_TMP_DISPLAY = "Temporary topics directory";
+
   private static final Collection<Object> FORMAT_CLASS_VALID_VALUES = Arrays.<Object>asList(
       AvroFormat.class,
       JsonFormat.class,
@@ -677,6 +690,30 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
           Width.LONG,
           "Schema Partition Affix Type",
           SCHEMA_PARTITION_AFFIX_TYPE_RECOMMENDER
+      );
+
+      configDef.define(
+          TOPICS_DIR_TMP_CONFIG,
+          Type.STRING,
+          TOPICS_DIR_TMP_DEFAULT,
+          Importance.LOW,
+          TOPICS_DIR_TMP_DOC,
+          group,
+          ++orderInGroup,
+          Width.LONG,
+          TOPICS_DIR_TMP_DISPLAY
+      );
+
+      configDef.define(
+          FULL_COMMIT_NAME_ENABLED_CONFIG,
+          Type.BOOLEAN,
+          FULL_COMMIT_NAME_ENABLED_DEFAULT,
+          Importance.LOW,
+          FULL_COMMIT_NAME_ENABLED_DOC,
+          group,
+          ++orderInGroup,
+          Width.SHORT,
+          FULL_COMMIT_NAME_ENABLED_DISPLAY
       );
     }
 

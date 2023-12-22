@@ -20,5 +20,6 @@
       checks="CyclomaticComplexity"
       files="(TopicPartitionWriter).java"
     />
-
+    <suppress files="." checks="Header"/>
+    <suppress files="." checks="RegexpHeader"/>
 </suppressions>

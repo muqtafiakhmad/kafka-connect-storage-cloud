@@ -16,10 +16,25 @@
 package io.confluent.connect.s3;
 
 import com.amazonaws.SdkClientException;
+import io.confluent.common.utils.SystemTime;
+import io.confluent.common.utils.Time;
+import io.confluent.connect.s3.format.CustomRecordWriter;
+import io.confluent.connect.s3.format.CustomRecordWriterProvider;
+import io.confluent.connect.s3.format.CustomRecordWriterProviderImpl;
 import io.confluent.connect.s3.storage.S3Storage;
 import io.confluent.connect.s3.util.RetryUtil;
 import io.confluent.connect.s3.util.TombstoneTimestampExtractor;
+import io.confluent.connect.storage.StorageSinkConnectorConfig;
+import io.confluent.connect.storage.common.StorageCommonConfig;
+import io.confluent.connect.storage.common.util.StringUtils;
 import io.confluent.connect.storage.errors.PartitionException;
+import io.confluent.connect.storage.format.RecordWriterProvider;
+import io.confluent.connect.storage.partitioner.Partitioner;
+import io.confluent.connect.storage.partitioner.PartitionerConfig;
+import io.confluent.connect.storage.partitioner.TimeBasedPartitioner;
+import io.confluent.connect.storage.partitioner.TimestampExtractor;
+import io.confluent.connect.storage.schema.StorageSchemaCompatibility;
+import io.confluent.connect.storage.util.DateTimeUtils;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.errors.ConnectException;
@@ -41,20 +56,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Queue;
 
-import io.confluent.common.utils.SystemTime;
-import io.confluent.common.utils.Time;
-import io.confluent.connect.storage.StorageSinkConnectorConfig;
-import io.confluent.connect.storage.common.StorageCommonConfig;
-import io.confluent.connect.storage.common.util.StringUtils;
-import io.confluent.connect.storage.format.RecordWriter;
-import io.confluent.connect.storage.format.RecordWriterProvider;
-import io.confluent.connect.storage.partitioner.Partitioner;
-import io.confluent.connect.storage.partitioner.PartitionerConfig;
-import io.confluent.connect.storage.partitioner.TimeBasedPartitioner;
-import io.confluent.connect.storage.partitioner.TimestampExtractor;
-import io.confluent.connect.storage.schema.StorageSchemaCompatibility;
-import io.confluent.connect.storage.util.DateTimeUtils;
-
 import static io.confluent.connect.s3.S3SinkConnectorConfig.S3_PART_RETRIES_CONFIG;
 import static io.confluent.connect.s3.S3SinkConnectorConfig.S3_RETRY_BACKOFF_CONFIG;
 
@@ -62,13 +63,16 @@ public class TopicPartitionWriter {
   private static final Logger log = LoggerFactory.getLogger(TopicPartitionWriter.class);
 
   private final Map<String, String> commitFiles;
-  private final Map<String, RecordWriter> writers;
+  private final Map<String, String> temporaryFiles;
+  private final Map<String, CustomRecordWriter> writers;
   private final Map<String, Schema> currentSchemas;
   private final TopicPartition tp;
   private final S3Storage storage;
   private final Partitioner<?> partitioner;
   private TimestampExtractor timestampExtractor;
   private String topicsDir;
+  private boolean fullCommitFilenameEnabled;
+  private String topicsDirTmp;
   private State state;
   private final Queue<SinkRecord> buffer;
   private final SinkTaskContext context;
@@ -84,7 +88,7 @@ public class TopicPartitionWriter {
   private String currentEncodedPartition;
   private Long baseRecordTimestamp;
   private Long offsetToCommit;
-  private final RecordWriterProvider<S3SinkConnectorConfig> writerProvider;
+  private final CustomRecordWriterProvider<S3SinkConnectorConfig> writerProvider;
   private final Map<String, Long> startOffsets;
   private final Map<String, Long> endOffsets;
   private final Map<String, Long> recordCounts;
@@ -126,7 +130,10 @@ public class TopicPartitionWriter {
     this.tp = tp;
     this.storage = storage;
     this.context = context;
-    this.writerProvider = writerProvider;
+    this.writerProvider = new CustomRecordWriterProviderImpl(
+        storage,
+        writerProvider
+    );
     this.partitioner = partitioner;
     this.reporter = reporter;
     this.timestampExtractor = null;
@@ -144,6 +151,9 @@ public class TopicPartitionWriter {
             .equalsIgnoreCase(S3SinkConnectorConfig.IgnoreOrFailBehavior.IGNORE.toString());
     flushSize = connectorConfig.getInt(S3SinkConnectorConfig.FLUSH_SIZE_CONFIG);
     topicsDir = connectorConfig.getString(StorageCommonConfig.TOPICS_DIR_CONFIG);
+    fullCommitFilenameEnabled = connectorConfig.getBoolean(
+        S3SinkConnectorConfig.FULL_COMMIT_NAME_ENABLED_CONFIG);
+    topicsDirTmp = connectorConfig.getString(S3SinkConnectorConfig.TOPICS_DIR_TMP_CONFIG);
     rotateIntervalMs = connectorConfig.getLong(S3SinkConnectorConfig.ROTATE_INTERVAL_MS_CONFIG);
     if (rotateIntervalMs > 0 && timestampExtractor == null) {
       log.warn(
@@ -165,6 +175,7 @@ public class TopicPartitionWriter {
 
     buffer = new LinkedList<>();
     commitFiles = new HashMap<>();
+    temporaryFiles = new HashMap<>();
     writers = new HashMap<>();
     currentSchemas = new HashMap<>();
     startOffsets = new HashMap<>();
@@ -362,7 +373,7 @@ public class TopicPartitionWriter {
 
   public void close() throws ConnectException {
     log.debug("Closing TopicPartitionWriter {}", tp);
-    for (RecordWriter writer : writers.values()) {
+    for (CustomRecordWriter writer : writers.values()) {
       writer.close();
     }
     writers.clear();
@@ -500,17 +511,30 @@ public class TopicPartitionWriter {
     context.resume(tp);
   }
 
-  private RecordWriter newWriter(SinkRecord record, String encodedPartition)
+  private CustomRecordWriter newWriter(SinkRecord record, String encodedPartition)
       throws ConnectException {
-    String commitFilename = getCommitFilename(encodedPartition);
+    String temporaryFilename = getTemporaryFilename(encodedPartition);
     log.debug(
-        "Creating new writer encodedPartition='{}' filename='{}'",
+        "Creating new writer encodedPartition='{}' temporary filename='{}'",
         encodedPartition,
-        commitFilename
+        temporaryFilename
     );
-    RecordWriter writer = writerProvider.getRecordWriter(connectorConfig, commitFilename);
+    CustomRecordWriter writer = writerProvider.getRecordWriter(connectorConfig, temporaryFilename);
     writers.put(encodedPartition, writer);
     return writer;
+  }
+
+  private String getTemporaryFilename(String encodedPartition) {
+    String temporaryFile;
+    if (temporaryFiles.containsKey(encodedPartition)) {
+      temporaryFile = temporaryFiles.get(encodedPartition);
+    } else {
+      String prefix = getDirectoryPrefix(encodedPartition);
+      long startOffset = startOffsets.get(encodedPartition);
+      temporaryFile = fileKeyTemporary(prefix, startOffset);
+      temporaryFiles.put(encodedPartition, temporaryFile);
+    }
+    return temporaryFile;
   }
 
   private String getCommitFilename(String encodedPartition) {
@@ -519,8 +543,10 @@ public class TopicPartitionWriter {
       commitFile = commitFiles.get(encodedPartition);
     } else {
       long startOffset = startOffsets.get(encodedPartition);
+      long endOffset = endOffsets.get(encodedPartition);
+      long recordCount = recordCounts.get(encodedPartition);
       String prefix = getDirectoryPrefix(encodedPartition);
-      commitFile = fileKeyToCommit(prefix, startOffset);
+      commitFile = fileKeyToCommit(prefix, startOffset, endOffset, recordCount);
       commitFiles.put(encodedPartition, commitFile);
     }
     return commitFile;
@@ -533,22 +559,43 @@ public class TopicPartitionWriter {
            : suffix;
   }
 
-  private String fileKeyToCommit(String dirPrefix, long startOffset) {
+  private String fileKeyTemporary(String dirPrefix, long startOffset) {
+    String temporaryFilename = tp.topic()
+        + fileDelim
+        + tp.partition()
+        + fileDelim
+        + String.format(zeroPadOffsetFormat, startOffset)
+        + extension;
+    if (fullCommitFilenameEnabled) {
+      return fileKey(topicsDirTmp, dirPrefix, temporaryFilename);
+    } else {
+      return fileKey(topicsDir, dirPrefix, temporaryFilename);
+    }
+  }
+
+  private String fileKeyToCommit(String dirPrefix,
+                                 long startOffset,
+                                 long endOffset,
+                                 long recordCount) {
     String name = tp.topic()
-                      + fileDelim
-                      + tp.partition()
-                      + fileDelim
-                      + String.format(zeroPadOffsetFormat, startOffset)
-                      + extension;
+        + fileDelim
+        + tp.partition()
+        + fileDelim
+        + String.format(zeroPadOffsetFormat, startOffset)
+        + fileDelim
+        + String.format(zeroPadOffsetFormat, endOffset)
+        + fileDelim
+        + recordCount
+        + extension;
     return fileKey(topicsDir, dirPrefix, name);
   }
 
   private boolean writeRecord(SinkRecord record, String encodedPartition) {
-    RecordWriter writer = writers.get(encodedPartition);
+    CustomRecordWriter writer = writers.get(encodedPartition);
     long currentOffsetIfSuccessful = record.kafkaOffset();
     boolean shouldRemoveWriter = false;
     boolean shouldRemoveStartOffset = false;
-    boolean shouldRemoveCommitFilename = false;
+    boolean shouldRemoveTemporaryFilename = false;
     try {
       if (!startOffsets.containsKey(encodedPartition)) {
         log.trace(
@@ -560,8 +607,8 @@ public class TopicPartitionWriter {
         shouldRemoveStartOffset = true;
       }
       if (writer == null) {
-        if (!commitFiles.containsKey(encodedPartition)) {
-          shouldRemoveCommitFilename = true;
+        if (!temporaryFiles.containsKey(encodedPartition)) {
+          shouldRemoveTemporaryFilename = true;
         }
         writer = newWriter(record, encodedPartition);
         shouldRemoveWriter = true;
@@ -575,8 +622,8 @@ public class TopicPartitionWriter {
         if (shouldRemoveWriter) {
           writers.remove(encodedPartition);
         }
-        if (shouldRemoveCommitFilename) {
-          commitFiles.remove(encodedPartition);
+        if (shouldRemoveTemporaryFilename) {
+          temporaryFiles.remove(encodedPartition);
         }
         reporter.report(record, e);
         log.warn("Errant record written to DLQ due to: {}", e.getMessage());
@@ -610,7 +657,7 @@ public class TopicPartitionWriter {
   }
 
   private void commitFiles() {
-    for (Map.Entry<String, String> entry : commitFiles.entrySet()) {
+    for (Map.Entry<String, String> entry : temporaryFiles.entrySet()) {
       String encodedPartition = entry.getKey();
       commitFile(encodedPartition);
       if (isTaggingEnabled) {
@@ -627,6 +674,7 @@ public class TopicPartitionWriter {
     }
 
     offsetToCommit = currentOffset + 1;
+    temporaryFiles.clear();
     commitFiles.clear();
     currentSchemas.clear();
     recordCount = 0;
@@ -641,9 +689,16 @@ public class TopicPartitionWriter {
     }
 
     if (writers.containsKey(encodedPartition)) {
-      RecordWriter writer = writers.get(encodedPartition);
+      CustomRecordWriter writer = writers.get(encodedPartition);
       // Commits the file and closes the underlying output stream.
-      writer.commit();
+      if (fullCommitFilenameEnabled) {
+        String commitFilename = getCommitFilename(encodedPartition);
+        writer.commit(commitFilename);
+        log.debug("Commit for '{}' on commit filename '{}'", encodedPartition, commitFilename);
+      } else {
+        writer.commit();
+        log.debug("Commit for '{}' on commit filename '{}'", encodedPartition);
+      }
       writers.remove(encodedPartition);
       log.debug("Removed writer for '{}'", encodedPartition);
     }
